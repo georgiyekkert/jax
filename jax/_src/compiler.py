@@ -33,7 +33,6 @@ from jax._src import monitoring
 from jax._src import profiler
 from jax._src import traceback_util
 from jax._src.interpreters import mlir
-from jax._src.lib import xla_extension_version
 from jax._src.lib.mlir import ir
 from jax._src.lib import xla_client as xc
 
@@ -249,21 +248,12 @@ def compile_or_get_cached(
   if dumped_to := mlir.dump_module_to_file(computation, "compile"):
     logging.info("Dumped the module to %s.", dumped_to)
 
-  # Persistent compilation cache only implemented on TPU and GPU.
-  # TODO(skye): add warning when initializing cache on unsupported default platform
-  supported_platforms = ["tpu", "gpu"]
-  if xla_extension_version >= 230:
-    supported_platforms.append("cpu")
-  use_compilation_cache = (config.enable_compilation_cache.value and
-                           backend.platform in supported_platforms)
+  use_compilation_cache = compilation_cache.is_cache_used(backend)
 
   if not use_compilation_cache:
     return backend_compile(backend, computation, compile_options,
                            host_callbacks)
 
-  compilation_cache.set_once_cache_used(
-      lambda: monitoring.record_event(
-          "/jax/compilation_cache/tasks_using_cache"))
   monitoring.record_event('/jax/compilation_cache/compile_requests_use_cache')
 
   try:

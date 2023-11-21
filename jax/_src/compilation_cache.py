@@ -33,6 +33,7 @@ from jax._src import config
 from jax._src import monitoring
 from jax._src.gfile_cache import GFileCache
 from jax._src.lib import xla_client
+from jax._src.lib import xla_extension_version
 from jax._src.lib.mlir import ir
 
 
@@ -42,25 +43,42 @@ _cache: CacheInterface | None = None
 
 _cache_initialized: bool = False
 
+_cache_checked: bool = False
+
 _cache_used: bool = False
 
-# Mutex to protect _cache_initialized and _cache_used.
+# Mutex to protect _cache_initialized, _cache_checked and _cache_used.
 _cache_initialized_mutex = threading.Lock()
 
 
-def set_once_cache_used(f) -> None:
-  """One-time setting of _cache_used.
-
-  If _cache_used is False, set it to True and execute the provided function
-  f. No action if _cache_used is True. This provides a mechanism to execute f
-  once per task. Note that reset_cache() will reset _cache_used also.
+def is_cache_used(backend: xla_client.Client) -> bool:
+  """Check if cache is used and report adoption metrics one-time per task.
+  The cache may be initialized during the first call to this function.
   """
-  global _cache_used
+  # Return _cache_used directly if _cache_checked is True. If _cache_checked is
+  # False, set it to True, report metrics and return if cache is used. This
+  # provides a mechanism to report the metrics once per task. Note that
+  # reset_cache() will reset _cache_checked and _cache_used also.
+  global _cache_checked, _cache_used
   with _cache_initialized_mutex:
-    if not _cache_used:
+    if _cache_checked:
+      return _cache_used
+
+    _cache_checked = True
+    # Persistent compilation cache only implemented on TPU and GPU.
+    # TODO(skye): add warning when initializing cache on unsupported default
+    # platform
+    supported_platforms = ["tpu", "gpu"]
+    if xla_extension_version >= 230:
+      supported_platforms.append("cpu")
+    support_platform = backend.platform in supported_platforms
+
+    if not _is_cache_enabled():
+      monitoring.record_event('/jax/compilation_cache/task_disabled_cache')
+    elif support_platform and _get_cache_locked() is not None:
+      monitoring.record_event('/jax/compilation_cache/tasks_using_cache')
       _cache_used = True
-      if f is not None:
-        f()
+    return _cache_used
 
 
 def get_file_cache(path: str) -> CacheInterface:
@@ -102,32 +120,32 @@ def _is_cache_enabled() -> bool:
 def _initialize_cache() -> None:
   # Attempt to initialize the cache at most once.
   global _cache_initialized
-  with _cache_initialized_mutex:
-    if _cache_initialized:
-      logger.debug("_initialize_cache: cache has already been initialized!")
-      return
-    _cache_initialized = True
+  assert _cache_initialized_mutex.locked(), "_initialize_cache is not protected"
+  if _cache_initialized:
+    logger.debug("_initialize_cache: cache has already been initialized!")
+    return
+  _cache_initialized = True
 
-    # Nothing to do if the cache is disabled.
-    if not _is_cache_enabled():
-      logger.debug("_initialize_cache: cache is disabled!")
-      return
+  # Nothing to do if the cache is disabled.
+  if not _is_cache_enabled():
+    logger.debug("_initialize_cache: cache is disabled!")
+    return
 
-    # Set the minimum cache size entry only if the flag
-    # --jax_persistent_cache_min_entry_size_bytes has not been set.
-    if config.persistent_cache_min_entry_size_bytes.value == 0:
-      config.config.update("jax_persistent_cache_min_entry_size_bytes",
-                           default_min_cache_entry_size())
+  # Set the minimum cache size entry only if the flag
+  # --jax_persistent_cache_min_entry_size_bytes has not been set.
+  if config.persistent_cache_min_entry_size_bytes.value == 0:
+    config.config.update("jax_persistent_cache_min_entry_size_bytes",
+                         default_min_cache_entry_size())
 
-    global _cache
-    assert _cache is None, "The cache has already been initialized!"
-    path: str = config.compilation_cache_dir.value
-    # If the path is not set, the cache will not be enabled.
-    if not path:
-      return
+  global _cache
+  assert _cache is None, "The cache has already been initialized!"
+  path: str = config.compilation_cache_dir.value
+  # If the path is not set, the cache will not be enabled.
+  if not path:
+    return
 
-    _cache = get_file_cache(path)
-    logger.debug("Initialized persistent compilation cache at %s", path)
+  _cache = get_file_cache(path)
+  logger.debug("Initialized persistent compilation cache at %s", path)
 
 
 def _get_cache() -> CacheInterface | None:
@@ -135,9 +153,16 @@ def _get_cache() -> CacheInterface | None:
   # get_executable_and_time() and put_executable_and_time() to call get_cache()
   # and passing the result to them.
   if _cache is None:
-    _initialize_cache()  # initialization is done at most once; see above
+    with _cache_initialized_mutex:
+      _get_cache_locked()
   return _cache
 
+
+def _get_cache_locked() -> CacheInterface | None:
+  assert _cache_initialized_mutex.locked(), "_get_cache_locked is not protected"
+  if _cache is None:
+    _initialize_cache()
+  return _cache
 
 def compress_executable(executable):
   if zstandard:
@@ -238,12 +263,14 @@ def reset_cache() -> None:
   """Get back to pristine, uninitialized state."""
   global _cache
   global _cache_initialized
+  global _cache_checked
   global _cache_used
   logger.debug("Resetting cache at %s.",
                _cache._path if _cache is not None else "<empty>")
   _cache = None
   with _cache_initialized_mutex:
     _cache_initialized = False
+    _cache_checked = False
     _cache_used = False
 
 
