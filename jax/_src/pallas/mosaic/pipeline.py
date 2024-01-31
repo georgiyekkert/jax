@@ -143,8 +143,14 @@ def _get_next_indices(grid: core.Grid, indices: GridIndices) -> GridIndices:
   return tuple(reversed(next_indices))
 
 
+def _replace_nones_in_block_spec(block_spec: core.BlockSpec) -> core.BlockSpec:
+  block_shape = block_spec.block_shape
+  block_shape = tuple([1 if dim is None else dim for dim in block_shape])
+  return dataclasses.replace(block_spec, block_shape=block_shape)
+
+
 def _run_block_spec(
-    block_spec: core.BlockSpec, indices: GridIndices
+    block_spec: core.BlockSpec, indices: GridIndices, scalars: list[SMEM]
 ) -> tuple[Union[slice, indexing.Slice], ...]:
   """Runs a block spec for the given indices and returns the slices.
 
@@ -158,7 +164,7 @@ def _run_block_spec(
   index_map = block_spec.index_map
   if index_map is None:
     raise ValueError("Block spec index_map is None.")
-  block_indices = index_map(*indices)
+  block_indices = index_map(*indices, *scalars)
   return tuple(
       indexing.ds(
           primitives.multiple_of(index * block_size, block_size), block_size
@@ -199,6 +205,7 @@ def _block_copy(
     is_wait: bool,
     force_copy: Optional[Union[jax.Array, bool]] = None,
     force_skip: Optional[Union[jax.Array, bool]] = None,
+    scalars: list[SMEM],
 ):
   """General purpose input/output block copys.
 
@@ -224,6 +231,7 @@ def _block_copy(
     is_wait: True if we want to wait on instead of start a copy.
     force_copy: Force copy if this condition is True. force_skip overrides this.
     force_skip: Force skipping the operation if this condition is True.
+    scalars: List of SMEM values to pass to block spec index maps.
 
   Returns:
     Current and next buffer indices, swapped if a copy was started.
@@ -234,9 +242,9 @@ def _block_copy(
   (vmem_ref, sem) = allocation.vmem_ref, allocation.semaphore
   (prev_indices, curr_indices, next_indices) = indices
 
-  prev_dma_slice = _run_block_spec(block_spec, prev_indices)
-  dma_slice = _run_block_spec(block_spec, curr_indices)
-  next_dma_slice = _run_block_spec(block_spec, next_indices)
+  prev_dma_slice = _run_block_spec(block_spec, prev_indices, scalars)
+  dma_slice = _run_block_spec(block_spec, curr_indices, scalars)
+  next_dma_slice = _run_block_spec(block_spec, next_indices, scalars)
 
   prev_dma_slice_changed = _dma_slice_not_equal(prev_dma_slice, dma_slice)
   dma_slice_is_changing = _dma_slice_not_equal(dma_slice, next_dma_slice)
@@ -345,6 +353,7 @@ class PipelinePrefetchArgs:
   pipeline_refs: PipelineArg[PipelineRefs]
   pipeline_allocations: PipelineArg[PipelineAllocations]
   pipeline_buffers: PipelineArg[PipelineBuffers]
+  scalars: list[SMEM] = None
 
 
 class StartPipelinePrefetch(Protocol):
@@ -399,6 +408,7 @@ class Pipeline(Protocol):
       self,
       *ref_args: PipelineRefs,
       scratchs: PipelineRefs = None,
+      scalars: Union[list[SMEM], None] = None,
       allocations: Union[None, Any] = None,
       init_allocations: CondVal = False,
       prologue: Union[PipelinePrologue, None] = None,
@@ -459,6 +469,10 @@ def emit_pipeline_with_allocations(
       in_specs, out_specs, in_out_specs
   )
   del in_specs, out_specs, should_accumulate_out, in_out_specs
+  pipeline_specs_with_nones = pipeline_specs
+  pipeline_specs = jax.tree_util.tree_map(
+      _replace_nones_in_block_spec, pipeline_specs_with_nones
+  )
 
   def make_pipeline_refs(
       *ref_args: PipelineRefs,
@@ -474,9 +488,19 @@ def emit_pipeline_with_allocations(
           bool, tuple[Union[CondVal, Any], Union[CondVal, Any]]
       ] = False,
   ) -> tuple[PipelineBuffers, PipelineBuffers]:
+    scalars = prefetch_args.scalars
+    if prefetch_args.scalars is None:
+      scalars = []
+    if not isinstance(scalars, (list, tuple)):
+      scalars = [scalars]
     if isinstance(force_copy, bool):
       next_in_and_in_out_buffers = tree_util.tree_map(
-          partial(_start_block_copy_in, indices=indices, force_copy=force_copy),
+          partial(
+              _start_block_copy_in,
+              indices=indices,
+              force_copy=force_copy,
+              scalars=scalars,
+          ),
           pipeline_specs.input_and_in_out,
           prefetch_args.pipeline_refs.input_and_in_out,
           prefetch_args.pipeline_allocations.input_and_in_out,
@@ -495,7 +519,7 @@ def emit_pipeline_with_allocations(
           pipeline_specs.out,
       )
       next_in_and_in_out_buffers = _tree_map_with_kwargs(
-          partial(_start_block_copy_in, indices=indices),
+          partial(_start_block_copy_in, indices=indices, scalars=scalars),
           pipeline_specs.input_and_in_out,
           prefetch_args.pipeline_refs.input_and_in_out,
           prefetch_args.pipeline_allocations.input_and_in_out,
@@ -561,7 +585,8 @@ def emit_pipeline_with_allocations(
 
   def pipeline(
       *ref_args: PipelineRefs,
-      scratchs: PipelineRefs = None,
+      scratchs: Union[PipelineRefs, None] = None,
+      scalars: Union[list[SMEM], None] = None,
       allocations: Union[
           None,
           tuple[PipelineArg[PipelineBuffers], PipelineArg[PipelineAllocations]],
@@ -577,6 +602,10 @@ def emit_pipeline_with_allocations(
       scratchs = []
     if not isinstance(scratchs, (list, tuple)):
       scratchs = [scratchs]
+    if scalars is None:
+      scalars = []
+    if not isinstance(scalars, (list, tuple)):
+      scalars = [scalars]
 
     def pipeline_body(
         pipeline_refs: PipelineArg[PipelineRefs],
@@ -604,7 +633,7 @@ def emit_pipeline_with_allocations(
 
       zero_indices = (jnp.array(0, dtype=jnp.int32),) * len(grid)
       last_indices = tuple(
-          [jnp.array(dim_size - 1, dtype=jnp.int32) for dim_size in grid]
+          [jnp.asarray(dim_size - 1, dtype=jnp.int32) for dim_size in grid]
       )
       indices = zero_indices
       pipeline_buffers: PipelineArg[PipelineBuffers] = tree_util.tree_map(
@@ -660,6 +689,7 @@ def emit_pipeline_with_allocations(
               _start_block_copy_in,
               indices=(indices, indices, indices),
               force_copy=True,
+              scalars=scalars,
           ),
           pipeline_specs.input,
           pipeline_refs.input,
@@ -678,6 +708,7 @@ def emit_pipeline_with_allocations(
                   _start_block_copy_in,
                   indices=(indices, indices, indices),
                   force_copy=True,
+                  scalars=scalars,
               ),
               pipeline_specs.in_out,
               pipeline_refs.in_out,
@@ -729,8 +760,7 @@ def emit_pipeline_with_allocations(
           )
           _tree_map_with_kwargs(
               partial(
-                  _wait_block_copy_in,
-                  indices=copy_indices,
+                  _wait_block_copy_in, indices=copy_indices, scalars=scalars
               ),
               *input_copy_args,
               force_copy=tree_util.tree_map(
@@ -743,8 +773,7 @@ def emit_pipeline_with_allocations(
               use_in_out,
               lambda: _tree_map_with_kwargs(
                   partial(
-                      _wait_block_copy_in,
-                      indices=copy_indices,
+                      _wait_block_copy_in, indices=copy_indices, scalars=scalars
                   ),
                   *in_out_copy_args,
                   force_copy=tree_util.tree_map(
@@ -759,8 +788,7 @@ def emit_pipeline_with_allocations(
           def start_next_iteration_in_block_copies():
             next_in_buffers = tree_util.tree_map(
                 partial(
-                    _start_block_copy_in,
-                    indices=copy_indices,
+                    _start_block_copy_in, indices=copy_indices, scalars=scalars
                 ),
                 *input_copy_args,
             )
@@ -770,6 +798,7 @@ def emit_pipeline_with_allocations(
                     partial(
                         _start_block_copy_in,
                         indices=copy_indices,
+                        scalars=scalars,
                     ),
                     *in_out_copy_args,
                 ),
@@ -805,6 +834,7 @@ def emit_pipeline_with_allocations(
         with tpu_primitives.trace("ep_kernel"):
 
           def grab_body_ref(
+              spec_with_nones,
               spec,
               allocation,
               buffers,
@@ -812,14 +842,23 @@ def emit_pipeline_with_allocations(
               in_out_existing_allocation=None,
           ):
             if existing_allocation is None:
-              return allocation.vmem_ref.at[buffers.current]
-            dma_slice = _run_block_spec(spec, indices)
+              buffer_slice = tuple([
+                  0 if dim is None else slice(None)
+                  for dim in spec_with_nones.block_shape
+              ])
+              return allocation.vmem_ref.at[buffers.current, *buffer_slice]
+            dma_slice = _run_block_spec(spec, indices, scalars)
+            dma_slice = tuple([
+                0 if dim is None else _slice
+                for dim, _slice in zip(spec_with_nones.block_shape, dma_slice)
+            ])
             if in_out_existing_allocation is None:
               return existing_allocation.at[dma_slice]
             return in_out_existing_allocation.at[dma_slice]
 
           in_args = tree_util.tree_map(
               grab_body_ref,
+              pipeline_specs_with_nones.input,
               pipeline_specs.input,
               pipeline_allocations.input,
               pipeline_buffers.input,
@@ -827,6 +866,7 @@ def emit_pipeline_with_allocations(
           )
           out_args = tree_util.tree_map(
               grab_body_ref,
+              pipeline_specs_with_nones.out,
               pipeline_specs.out,
               pipeline_allocations.out,
               pipeline_buffers.out,
@@ -834,7 +874,7 @@ def emit_pipeline_with_allocations(
               in_out_existing_allocations,
           )
           with core.grid_env(cast(Any, zip(indices, grid))):
-            body(*in_args, *out_args, *scratchs)
+            body(*scalars, *in_args, *out_args, *scratchs)
 
           def accum_existing_in_out_existing_allocation(
               spec,
@@ -845,8 +885,8 @@ def emit_pipeline_with_allocations(
                 existing_allocation is not None
                 and in_out_existing_allocation is not None
             ):
-              dma_slice = _run_block_spec(spec, indices)
-              next_dma_slice = _run_block_spec(spec, next_indices)
+              dma_slice = _run_block_spec(spec, indices, scalars)
+              next_dma_slice = _run_block_spec(spec, next_indices, scalars)
               dma_slice_is_changing = _dma_slice_not_equal(
                   dma_slice, next_dma_slice
               )
@@ -905,6 +945,7 @@ def emit_pipeline_with_allocations(
                   partial(
                       _wait_block_copy_out,
                       indices=copy_indices,
+                      scalars=scalars,
                   ),
                   pipeline_specs.out,
                   pipeline_refs.out,
@@ -917,8 +958,7 @@ def emit_pipeline_with_allocations(
           def wait_prev_iteration_out_block_copies():
             tree_util.tree_map(
                 partial(
-                    _wait_block_copy_out,
-                    indices=copy_indices,
+                    _wait_block_copy_out, indices=copy_indices, scalars=scalars
                 ),
                 pipeline_specs.out,
                 pipeline_refs.out,
@@ -938,6 +978,7 @@ def emit_pipeline_with_allocations(
                       _start_block_copy_out,
                       indices=copy_indices,
                       force_copy=i == total_iterations - 1,
+                      scalars=scalars,
                   ),
                   pipeline_specs.out,
                   pipeline_refs.out,
@@ -951,6 +992,7 @@ def emit_pipeline_with_allocations(
                       _start_block_copy_out,
                       indices=copy_indices,
                       force_copy=i == total_iterations - 1,
+                      scalars=scalars,
                   ),
                   pipeline_specs.out,
                   pipeline_refs.out,
@@ -1013,6 +1055,7 @@ def emit_pipeline_with_allocations(
                   _wait_block_copy_out,
                   indices=(prev_indices, indices, zero_indices),
                   force_copy=True,
+                  scalars=scalars,
               ),
               pipeline_specs.out,
               pipeline_refs.out,

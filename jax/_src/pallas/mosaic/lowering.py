@@ -763,7 +763,8 @@ def _indexer_to_start_size(
       else _index_to_start_size(next(indices_iter), cast_to_index)
       for s in ref_block_shape
   )
-  assert next(indices_iter, None) is None
+  next_index = next(indices_iter, None)
+  assert next_index is None, (indexer.indices, ref_block_shape)
   new_ref_block_shape = tuple(s for s, squeeze in zip(sizes, squeeze_dims)
                               if not squeeze)
   return tuple(starts), tuple(sizes), tuple(squeeze_dims), new_ref_block_shape
@@ -1647,9 +1648,12 @@ def _lower_jaxpr_to_for_loop(ctx: LoweringRuleContext,
     raise NotImplementedError(
         f"Only unroll={num_steps=} and unroll=1 supported. Got {unroll=}.")
   lbd = ir_constant(0, mlir_type=mlir.dtype_to_ir_type(jnp.dtype("int32")))
-  ubd = ir_constant(
-      num_steps, mlir_type=_dtype_to_ir_type(jnp.dtype("int32"))
-  )
+  if isinstance(num_steps, int):
+    ubd = ir_constant(
+        num_steps, mlir_type=_dtype_to_ir_type(jnp.dtype("int32"))
+    )
+  else:
+    ubd = num_steps
   step = ir_constant(1, mlir_type=_dtype_to_ir_type(jnp.dtype("int32")))
   for_op = scf.ForOp(lbd, ubd, step, args)
   with ir.InsertionPoint(for_op.body):
@@ -1726,6 +1730,90 @@ def _scan_lowering_rule(
 lowering_rules[lax.scan_p] = _scan_lowering_rule
 skip_mlir_conversions.add(lax.scan_p)
 
+
+def _while_lowering_rule(
+    ctx: LoweringRuleContext,
+    *args,
+    cond_nconsts,
+    cond_jaxpr,
+    body_nconsts,
+    body_jaxpr,
+):
+  # Try to pattern match to fori loop.
+  if cond_nconsts:
+    raise NotImplementedError
+  _, cond_invars = split_list(cond_jaxpr.jaxpr.invars, [cond_nconsts])
+  cond_in_avals = [v.aval for v in cond_invars]
+  if len(cond_in_avals) < 2:
+    raise NotImplementedError
+  # Check that the first two carry values are scalar ints
+  a1, a2 = cond_in_avals[:2]
+  if a1.shape != () or a1.dtype not in (jnp.int32, jnp.int64):
+    raise NotImplementedError
+  if a2.shape != () or a2.dtype not in (jnp.int32, jnp.int64):
+    raise NotImplementedError
+  # Check that the only eqn in the cond checks the loop index condition
+  v1, v2 = cond_invars[:2]
+  outvar = cond_jaxpr.jaxpr.outvars[0]
+  assert outvar.aval.dtype == jnp.bool_
+  if len(cond_jaxpr.jaxpr.eqns) != 1:
+    raise NotImplementedError
+  eqn = cond_jaxpr.jaxpr.eqns[0]
+  if eqn.primitive != lax.lt_p:
+    raise NotImplementedError
+  if eqn.outvars != [outvar]:
+    raise NotImplementedError
+  if eqn.invars != [v1, v2]:
+    raise NotImplementedError
+  # Check that the carry is updated in the body appropriately
+  _, body_invars = split_list(body_jaxpr.jaxpr.invars, [body_nconsts])
+  v1, v2 = body_invars[:2]
+  vo1, vo2 = body_jaxpr.jaxpr.outvars[:2]
+  # Upper bound should be constant
+  if v2 is not vo2:
+    raise NotImplementedError
+  # Check that we increment the loop index in the body
+  for i, eqn in enumerate(body_jaxpr.jaxpr.eqns):
+    if eqn.primitive is lax.add_p:
+      if eqn.invars[0] is v1:
+        if isinstance(eqn.invars[1], jax_core.Literal):
+          if eqn.invars[1].val == 1:
+            if eqn.outvars[0] == vo1:
+              eqn_index = i
+              break
+  else:
+    raise NotImplementedError
+  jaxpr = body_jaxpr.jaxpr
+  new_invars = (
+      *jaxpr.invars[:body_nconsts],
+      jaxpr.invars[body_nconsts],
+      *jaxpr.invars[body_nconsts + 2 :],
+  )
+  new_outvars = tuple(jaxpr.outvars[2:])
+  jaxpr = jaxpr.replace(
+      eqns=jaxpr.eqns[:eqn_index] + jaxpr.eqns[eqn_index + 1 :],
+      invars=new_invars,
+      outvars=new_outvars,
+  )
+  _, body_consts, carry = split_list(args, [cond_nconsts, body_nconsts])
+  (lb, ub), args = carry[:2], carry[2:]
+  for_out = _lower_jaxpr_to_for_loop(
+      ctx.replace(
+          block_shapes=ctx.block_shapes[: body_nconsts + 1]
+          + ctx.block_shapes[body_nconsts + 2 :],
+      ),
+      jaxpr,
+      lb,
+      ub,
+      body_consts,
+      *args,
+      has_loop_index=True,
+      unroll=1,
+  )
+  return [ub, ub, *for_out]
+
+
+lowering_rules[lax.while_p] = _while_lowering_rule
 
 def _cond_lowering_rule(ctx: LoweringRuleContext, *args, branches, linear):
   index, *args = args
