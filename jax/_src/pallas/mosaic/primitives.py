@@ -58,6 +58,30 @@ def _repeat_lowering_rule(ctx: mlir.LoweringRuleContext, x, *, repeats, axis):
   return mlir.lower_fun(_repeat, multiple_results=False)(ctx, x)
 mlir.register_lowering(repeat_p, _repeat_lowering_rule)
 
+roll_p = jax_core.Primitive("roll")
+
+
+def roll(
+    x,
+    shift: int,
+    axis: int,
+    *,
+    stride: int | None = None,
+    stride_axis: int | None = None,
+):
+  return roll_p.bind(
+      x, shift=shift, axis=axis, stride=stride, stride_axis=stride_axis
+  )
+
+
+@roll_p.def_abstract_eval
+def _roll_abstract_eval(x, **_):
+  return jax_core.ShapedArray(x.shape, x.dtype)
+
+
+mlir.register_lowering(roll_p, lambda ctx, **_: [])
+
+
 trace_start_p = jax_core.Primitive('trace_start')
 trace_start_p.multiple_results = True
 
