@@ -45,13 +45,16 @@ from jax import lax
 from jax._src import core
 
 
-@functools.partial(jax.jit, static_argnums=(2, 3))
+@functools.partial(jax.jit, static_argnums=(2, 3, 4))
 def _constant_svd(
-    a: Any, return_nan: bool, full_matrices: bool, compute_uv: bool = True
+    a: Any, return_nan: bool, full_matrices: bool, compute_uv: bool = True, subset_by_index: tuple[int, int] | None = None,
 ) -> Any | Sequence[Any]:
   """SVD on matrix of all zeros."""
   m, n = a.shape
   k = min(m, n)
+  if subset_by_index is not None:
+    k = min(k, subset_by_index[1] - subset_by_index[0])
+
   s = jnp.where(
       return_nan,
       jnp.full(shape=(k,), fill_value=jnp.nan, dtype=a.real.dtype),
@@ -90,9 +93,10 @@ def _constant_svd(
     return s
 
 
-@functools.partial(jax.jit, static_argnums=(1, 2, 3))
+@functools.partial(jax.jit, static_argnums=(1, 2, 3, 4))
 def _svd_tall_and_square_input(
-    a: Any, hermitian: bool, compute_uv: bool, max_iterations: int
+    a: Any, hermitian: bool, compute_uv: bool, max_iterations: int, subset_by_index: tuple[int, int] | None = None,
+
 ) -> Any | Sequence[Any]:
   """Singular value decomposition for m x n matrix and m >= n.
 
@@ -113,7 +117,7 @@ def _svd_tall_and_square_input(
                                max_iterations=max_iterations)
 
   # TODO: Uses `eigvals_only=True` if `compute_uv=False`.
-  v, s = lax.linalg.eigh(h)
+  v, s = lax.linalg.eigh(h, subset_by_index=subset_by_index)
   # Singular values are non-negative by definition. But eigh could return small
   # negative values, so we clamp them to zero.
   s = jnp.maximum(s, 0.0)
@@ -153,7 +157,8 @@ def _qdwh_svd(a: Any,
               full_matrices: bool,
               compute_uv: bool = True,
               hermitian: bool = False,
-              max_iterations: int = 10) -> Any | Sequence[Any]:
+              max_iterations: int = 10,
+              subset_by_index: tuple[int, int] | None = None) -> Any | Sequence[Any]:
   """Singular value decomposition.
 
   Args:
@@ -214,12 +219,14 @@ def _qdwh_svd(a: Any,
   return (u_out, s_out, v_out.T.conj())
 
 
-@functools.partial(jax.jit, static_argnums=(1, 2, 3, 4))
+@functools.partial(jax.jit, static_argnums=(1, 2, 3, 4, 5))
 def svd(a: Any,
         full_matrices: bool,
         compute_uv: bool = True,
         hermitian: bool = False,
-        max_iterations: int = 10) -> Any | Sequence[Any]:
+        max_iterations: int = 10,
+        subset_by_index: tuple[int, int] | None = None,
+        ) -> Any | Sequence[Any]:
   """Singular value decomposition.
 
   Args:
@@ -230,6 +237,10 @@ def svd(a: Any,
     compute_uv: Whether to compute also `u` and `v` in addition to `s`.
     hermitian: True if `a` is Hermitian.
     max_iterations: The predefined maximum number of iterations of QDWH.
+    subset_by_index: Optional 2-tuple [start, end] indicating the range of
+       indices of singular componenets to compute. For example, if
+       ``subset_by_index`` = [0,2], then ``svd`` computes the two largest
+       singular values (and their singular vectors if `compute_uv` is true.
 
   Returns:
     A 3-tuple (`u`, `s`, `vh`), where `u` and `vh` are unitary matrices,
@@ -248,11 +259,30 @@ def svd(a: Any,
 
   hermitian = core.concrete_or_error(
       bool, hermitian, 'The `hermitian` argument must be statically '
-      'specified to use `qdwh` within JAX transformations.')
+      'specified to use `svd` within JAX transformations.')
 
   max_iterations = core.concrete_or_error(
       int, max_iterations, 'The `max_iterations` argument must be statically '
-      'specified to use `qdwh` within JAX transformations.')
+      'specified to use `svd` within JAX transformations.')
+
+  if subset_by_index is not None:
+
+    subset_by_index = core.concrete_or_error(
+      int, subset_by_index, 'The `subset_by_index` argument must be statically '
+      'specified to use `svd` within JAX transformations.')
+    if full_matrices:
+      raise ValueError('full_matrices and subset_by_index cannot be both be set.')
+    if len(subset_by_index) != 2:
+      raise ValueError('subset_by_index must be a tuple of size 2.')
+    if subset_by_index[0] >= subset_by_index[1]:
+      raise ValueError('Got empty index range in subset_by_index.')
+    if subset_by_index[0] < 0:
+      raise ValueError('Indices in subset_by_index must be non-negative.')
+    m, n = a.shape
+    range_max = n if n < m else m
+    if subset_by_index[1] > range_max:
+      raise ValueError('Index in subset_by_index[1] exceeds matrix size.')
+
 
   # QDWH algorithm fails at zero-matrix `A` and produces all NaNs, which can
   # be seen from a dynamically weighted Halley (DWH) iteration:
@@ -268,6 +298,7 @@ def svd(a: Any,
           return_nan=non_finite,
           full_matrices=full_matrices,
           compute_uv=compute_uv,
+          subset_by_index=subset_by_index,
       ),
       functools.partial(
           _qdwh_svd,
@@ -275,6 +306,7 @@ def svd(a: Any,
           compute_uv=compute_uv,
           hermitian=hermitian,
           max_iterations=max_iterations,
+          subset_by_index=subset_by_index,
       ),
       operand=(a),
   )
