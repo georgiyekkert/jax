@@ -2795,6 +2795,22 @@ class LaxBackedNumpyTests(jtu.JaxTestCase):
     with self.assertRaises(TypeError):
       jnp.ones((-1, 1))
 
+  def testFullLike_commited(self):
+    x = jnp.array((1, 2, 3), dtype=np.int32)
+    self.assertFalse(x._committed)
+    self.assertFalse(lax.full_like(x, 1.1)._committed)
+    x = jax.device_put(x, jax.devices()[-1])
+    self.assertTrue(x._committed)
+    y = lax.full_like(x, 1.1)
+    self.assertTrue(y._committed)
+    self.assertEqual(x.sharding, y.sharding)
+
+  def testZerosLike_sharded_and_jitted(self):
+    x = jnp.array((1, 2, 3), dtype=np.int32)
+    x = jax.device_put(x, jax.devices()[0])
+    y = jax.jit(partial(jnp.zeros_like, device=jax.devices()[0]))(x)
+    self.assertEqual(x.shape, y.shape)
+
   @jtu.sample_product(
     [dict(shape=shape, out_shape=out_shape, fill_value_shape=fill_value_shape)
       for shape in array_shapes
