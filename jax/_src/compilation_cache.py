@@ -63,7 +63,7 @@ def set_once_cache_used(f) -> None:
         f()
 
 
-def get_file_cache(path: str) -> CacheInterface:
+def get_file_cache(path: str) -> CacheInterface | None:
   return GFileCache(path)
 
 
@@ -127,7 +127,10 @@ def _initialize_cache() -> None:
       return
 
     _cache = get_file_cache(path)
-    logger.debug("Initialized persistent compilation cache at %s", path)
+    if _cache is None:
+      logger.debug("_initialize_cache: cache is not initialized!")
+    else:
+      logger.debug("Initialized persistent compilation cache at %s", path)
 
 
 def _get_cache() -> CacheInterface | None:
