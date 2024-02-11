@@ -22,7 +22,7 @@ import logging
 import os
 import sys
 import threading
-from typing import Any, Callable, Generic, NamedTuple, NoReturn, TypeVar
+from typing import Any, Callable, Generic, NamedTuple, NoReturn, Optional, TypeVar
 import warnings
 
 from jax._src import lib
@@ -389,6 +389,7 @@ def define_bool_state(
   ``config.jax_enable_foo``. Reading it via ``config.FLAGS.jax_enable_foo`` is
   an error.
   """
+  assert isinstance(default, bool), default
   name = name.lower()
   if upgrade:
     help += ' ' + UPGRADE_BOOL_HELP
@@ -407,12 +408,58 @@ def define_bool_state(
 def define_enum_state(
     name: str,
     enum_values: list[str],
-    default: str | None,
+    default: str,
     help: str,
     *,
     update_global_hook: Callable[[str], None] | None = None,
     update_thread_local_hook: Callable[[str | None], None] | None = None,
 ) -> _StateContextManager[str]:
+  """Set up thread-local state and return a contextmanager for managing it.
+
+  See docstring for ``define_bool_state``.
+
+  Args:
+    name: string, converted to lowercase to define the name of the config
+      option (and absl flag). It is converted to uppercase to define the
+      corresponding shell environment variable.
+    enum_values: list of strings representing the possible values for the
+      option.
+    default: string, default value.
+    help: string, used to populate the flag help information as well as the
+      docstring of the returned context manager.
+
+  Returns:
+    A contextmanager to control the thread-local state value.
+  """
+  assert isinstance(default, str), default
+  name = name.lower()
+  default = os.getenv(name.upper(), default)
+  if default not in enum_values:
+    raise ValueError(f"Invalid value \"{default}\" for JAX flag {name}")
+  DEFINE_enum(name, default,
+              enum_values=enum_values, help=help,
+              update_hook=update_global_hook)
+  config._contextmanager_flags.add(name)
+
+  def validate(new_val):
+    if type(new_val) is not str or new_val not in enum_values:
+      raise ValueError(f"new enum value must be in {enum_values}, "
+                       f"got {new_val} of type {type(new_val)}.")
+
+  s = _StateContextManager[str](name, help, update_thread_local_hook, validate)
+  setattr(Config, name, property(lambda _: s.value))
+  return s
+
+
+def define_optional_enum_state(
+    name: str,
+    enum_values: list[str],
+    default: str | None,
+    help: str,
+    *,
+    update_global_hook: Callable[[str], None] | None = None,
+    update_thread_local_hook: Callable[[str | None], None] | None = None,
+) -> _StateContextManager[str | None]:
   """Set up thread-local state and return a contextmanager for managing it.
 
   See docstring for ``define_bool_state``.
@@ -430,6 +477,7 @@ def define_enum_state(
   Returns:
     A contextmanager to control the thread-local state value.
   """
+  assert default is None or isinstance(default, str), default
   name = name.lower()
   default = os.getenv(name.upper(), default)
   if default is not None and default not in enum_values:
@@ -445,14 +493,16 @@ def define_enum_state(
       raise ValueError(f"new enum value must be None or in {enum_values}, "
                        f"got {new_val} of type {type(new_val)}.")
 
-  s = _StateContextManager[str](name, help, update_thread_local_hook, validate)
+  s = _StateContextManager[Optional[str]](
+      name, help, update_thread_local_hook, validate
+  )
   setattr(Config, name, property(lambda _: s.value))
   return s
 
 
 def define_int_state(
     name: str,
-    default: int | None,
+    default: int,
     help: str,
     *,
     update_global_hook: Callable[[str], None] | None = None,
@@ -473,8 +523,9 @@ def define_int_state(
   Returns:
     A contextmanager to control the thread-local state value.
   """
+  assert isinstance(default, int), default
   name = name.lower()
-  default_env = os.getenv(name.upper(), default)
+  default_env = os.getenv(name.upper())
   if default_env is not None:
     try:
       default = int(default_env)
@@ -495,7 +546,7 @@ def define_int_state(
 
 def define_float_state(
     name: str,
-    default: float | None,
+    default: float,
     help: str,
     *,
     update_global_hook: Callable[[str], None] | None = None,
@@ -509,15 +560,16 @@ def define_float_state(
     name: string, converted to lowercase to define the name of the config
       option (and absl flag). It is converted to uppercase to define the
       corresponding shell environment variable.
-    default: optional float, default value.
+    default: default value.
     help: string, used to populate the flag help information as well as the
       docstring of the returned context manager.
 
   Returns:
     A contextmanager to control the thread-local state value.
   """
+  assert isinstance(default, float), default
   name = name.lower()
-  default_env = os.getenv(name.upper(), default)
+  default_env = os.getenv(name.upper())
   if default_env is not None:
     try:
       default = float(default_env)
@@ -540,7 +592,7 @@ def define_float_state(
 
 def define_string_state(
     name: str,
-    default: str | None,
+    default: str,
     help: str,
     *,
     update_global_hook: Callable[[str], None] | None = None,
@@ -566,10 +618,11 @@ def define_string_state(
   Returns:
     A contextmanager to control the thread-local state value.
   """
+  assert isinstance(default, str), default
 
   def validate(new_val):
-    if new_val is not None and not isinstance(new_val, str):
-      raise ValueError(f'new string config value must be None or of type str,'
+    if not isinstance(new_val, str):
+      raise ValueError('new string config value must be of type str,'
                        f' got {new_val} of type {type(new_val)}.')
 
   return define_string_or_object_state(
@@ -578,6 +631,47 @@ def define_string_state(
       update_thread_local_hook=update_thread_local_hook,
       validate_new_val_hook=validate)
 
+
+def define_optional_string_state(
+    name: str,
+    default: str | None,
+    help: str,
+    *,
+    update_global_hook: Callable[[str], None] | None = None,
+    update_thread_local_hook: Callable[[str | None], None] | None = None,
+) -> _StateContextManager[str | None]:
+  """Set up thread-local state and return a contextmanager for managing it.
+
+  See docstring for ``define_bool_state``.
+
+  Args:
+    name: string, converted to lowercase to define the name of the config
+      option (and absl flag). It is converted to uppercase to define the
+      corresponding shell environment variable.
+    default: optional string, a default value for the option.
+    help: string, used to populate the flag help information as well as the
+      docstring of the returned context manager.
+    update_global_hook: an optional callback that is called with the updated
+      value of the global state when it is altered or set initially.
+    update_thread_local_hook: an optional callback that is called with the
+      updated value of the thread-local state when it is altered or set
+      initially.
+
+  Returns:
+    A contextmanager to control the thread-local state value.
+  """
+  assert default is None or isinstance(default, str), default
+
+  def validate(new_val):
+    if new_val is not None and not isinstance(new_val, str):
+      raise ValueError('new string config value must be None or of type str,'
+                       f' got {new_val} of type {type(new_val)}.')
+
+  return define_string_or_object_state(
+      name, default, help,
+      update_global_hook=update_global_hook,
+      update_thread_local_hook=update_thread_local_hook,
+      validate_new_val_hook=validate)
 
 def define_string_or_object_state(
     name: str,
@@ -788,7 +882,7 @@ jax_serialization_version = define_int_state(
     )
 )
 
-jax_platforms = define_string_state(
+jax_platforms = define_optional_string_state(
     name='jax_platforms',
     default=None,
     help=(
@@ -990,7 +1084,7 @@ raise_persistent_cache_errors = define_bool_state(
 
 persistent_cache_min_compile_time_secs = define_float_state(
     name='jax_persistent_cache_min_compile_time_secs',
-    default=1,
+    default=1.,
     help=('The minimum compile time of a computation to be written to the '
           'persistent compilation cache. This threshold can be raised to '
           'decrease the number of entries written to the cache.'))
@@ -1018,7 +1112,7 @@ compilation_cache_include_metadata_in_key = define_bool_state(
     ),
 )
 
-hlo_source_file_canonicalization_regex = define_string_state(
+hlo_source_file_canonicalization_regex = define_optional_string_state(
     name='jax_hlo_source_file_canonicalization_regex',
     default=None,
     help=('Used to canonicalize the source_path metadata of HLO instructions '
@@ -1084,7 +1178,7 @@ enable_compilation_cache = define_bool_state(
           'set_cache_dir().'),
 )
 
-compilation_cache_dir = define_string_state(
+compilation_cache_dir = define_optional_string_state(
     name='jax_compilation_cache_dir',
     default=None,
     help=('Path for the cache. '
@@ -1195,7 +1289,7 @@ numpy_rank_promotion = define_enum_state(
     update_thread_local_hook=lambda val: \
       update_thread_local_jit_state(numpy_rank_promotion=val))
 
-default_matmul_precision = define_enum_state(
+default_matmul_precision = define_optional_enum_state(
     name='jax_default_matmul_precision',
     enum_values=['bfloat16', 'tensorfloat32', 'float32'],
     default=None,
@@ -1334,7 +1428,7 @@ def _update_transfer_guard(state, key, val):
   else:
     assert False, f'Invalid transfer guard level {val}'
 
-transfer_guard_host_to_device = define_enum_state(
+transfer_guard_host_to_device = define_optional_enum_state(
     name='jax_transfer_guard_host_to_device',
     enum_values=[
         'allow', 'log', 'disallow', 'log_explicit', 'disallow_explicit'
@@ -1349,7 +1443,7 @@ transfer_guard_host_to_device = define_enum_state(
     update_thread_local_hook=lambda val: _update_transfer_guard(
         transfer_guard_lib.thread_local_state(), 'host_to_device', val))
 
-transfer_guard_device_to_device = define_enum_state(
+transfer_guard_device_to_device = define_optional_enum_state(
     name='jax_transfer_guard_device_to_device',
     enum_values=[
         'allow', 'log', 'disallow', 'log_explicit', 'disallow_explicit'
@@ -1364,7 +1458,7 @@ transfer_guard_device_to_device = define_enum_state(
     update_thread_local_hook=lambda val: _update_transfer_guard(
         transfer_guard_lib.thread_local_state(), 'device_to_device', val))
 
-transfer_guard_device_to_host = define_enum_state(
+transfer_guard_device_to_host = define_optional_enum_state(
     name='jax_transfer_guard_device_to_host',
     enum_values=[
         'allow', 'log', 'disallow', 'log_explicit', 'disallow_explicit'
@@ -1385,7 +1479,7 @@ def _update_all_transfer_guard_global(val):
                'jax_transfer_guard_device_to_host'):
     config.update(name, val)
 
-_transfer_guard = define_enum_state(
+_transfer_guard = define_optional_enum_state(
     name='jax_transfer_guard',
     enum_values=[
         'allow', 'log', 'disallow', 'log_explicit', 'disallow_explicit'
